@@ -34,6 +34,7 @@ from .resolver import (
     resolve,
 )
 from .serialize import conflict_summary
+from .upgrade_feasibility import run_upgrade_feasibility
 from .version_withdrawal import run_version_withdrawal
 
 DEFAULT_DB_PATH = os.path.join("data", "jobs.db")
@@ -96,6 +97,21 @@ class EnvironmentMatrixRequest(ResolveBaseRequest):
         description=(
             "Named marker environments to resolve under, in comparison "
             "order. Each environment is solved independently."
+        ),
+    )
+
+
+class UpgradeFeasibilityRequest(ResolveRequest):
+    package: str = Field(
+        ..., min_length=1,
+        description="Target package to upgrade; normalized like index package names.",
+    )
+    candidates: list[str] = Field(
+        ..., min_length=1, max_length=8,
+        description=(
+            "Candidate exact versions of the target, 1-8 items in input "
+            "order. Each must exist in the package index and no two may "
+            "normalize to the same PEP 440 version."
         ),
     )
 
@@ -266,7 +282,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Local PEP 440 Dependency Resolver",
-    version="1.9.0",
+    version="1.10.0",
     description=(
         "Resolves transitive dependencies from a self-contained package index. "
         "No external package index or account is used."
@@ -598,6 +614,50 @@ async def version_withdrawal_endpoint(payload: VersionWithdrawalRequest) -> JSON
         max_attempts=payload.max_attempts,
         withdraw_package=payload.withdraw.package,
         withdraw_version=payload.withdraw.version,
+    )
+    return JSONResponse(status_code=200, content=body)
+
+
+@app.post("/analyze/upgrade-feasibility")
+async def upgrade_feasibility_endpoint(payload: UpgradeFeasibilityRequest) -> JSONResponse:
+    """Check 1-8 candidate upgrade versions of one package, independently.
+
+    Accepts the exact same request body as ``/resolve`` plus a target
+    ``package`` and 1-8 ``candidates`` versions.  For every candidate, in
+    input order, an exact-version root constraint (``==<candidate>``) is
+    *temporarily added* to the original root requirements — never replacing
+    them — and the whole project is re-solved with the ordinary exhaustive
+    backtracking.  The original roots, all other locks, the marker
+    environment and a full ``max_attempts`` budget participate in every
+    independent solve, so feasibility reflects the complete transitive
+    constraints rather than the target package's own version range.  A lock
+    on the target that contradicts the pin is falsified as usual.
+
+    Each candidate is reported in input order as one of:
+
+    * ``ok`` — complete ``resolved`` / ``dependency_graph`` / ``locks`` plus
+      ``changes`` relative to the original locks (added / removed / changed).
+    * ``conflict`` — structured ``conflict`` summary (same shape as
+      ``/resolve``) proving this candidate cannot be installed.
+    * ``undetermined`` — the solve hit ``max_attempts``; the search limit is
+      not treated as a proof of conflict, so the candidate is never reported
+      as uninstallable.
+
+    Every candidate keeps its own ``attempts``.  Valid requests always
+    return 200; an unknown target package, a candidate absent from the
+    index, a non-PEP-440 candidate, or PEP-440-duplicate candidates return
+    400; shape violations return 422.
+    """
+    index, entries, locks = _parse_input(payload)
+    body = run_upgrade_feasibility(
+        index,
+        entries,
+        locks,
+        allow_prereleases=payload.allow_prereleases,
+        marker_env=payload.marker_env,
+        max_attempts=payload.max_attempts,
+        target_package=payload.package,
+        candidate_versions=payload.candidates,
     )
     return JSONResponse(status_code=200, content=body)
 
