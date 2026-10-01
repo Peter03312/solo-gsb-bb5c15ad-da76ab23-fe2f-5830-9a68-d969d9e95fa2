@@ -34,6 +34,7 @@ from .resolver import (
     resolve,
 )
 from .serialize import conflict_summary
+from .upgrade_feasibility import run_upgrade_feasibility
 from .version_withdrawal import run_version_withdrawal
 
 DEFAULT_DB_PATH = os.path.join("data", "jobs.db")
@@ -119,6 +120,21 @@ class VersionWithdrawalRequest(ResolveRequest):
         description=(
             "The single package version removed from this request's index "
             "before the second solve."
+        ),
+    )
+
+
+class UpgradeFeasibilityRequest(ResolveRequest):
+    target: str = Field(
+        ..., min_length=1,
+        description="Package whose candidate versions are evaluated; normalized like index names.",
+    )
+    candidates: list[str] = Field(
+        ..., min_length=1, max_length=8,
+        description=(
+            "1-8 candidate versions of the target package, in input order. "
+            "Each must exist in the supplied index and remain unique after "
+            "PEP 440 normalization."
         ),
     )
 
@@ -266,7 +282,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Local PEP 440 Dependency Resolver",
-    version="1.9.0",
+    version="1.10.0",
     description=(
         "Resolves transitive dependencies from a self-contained package index. "
         "No external package index or account is used."
@@ -598,6 +614,44 @@ async def version_withdrawal_endpoint(payload: VersionWithdrawalRequest) -> JSON
         max_attempts=payload.max_attempts,
         withdraw_package=payload.withdraw.package,
         withdraw_version=payload.withdraw.version,
+    )
+    return JSONResponse(status_code=200, content=body)
+
+
+@app.post("/analyze/upgrade-feasibility")
+async def upgrade_feasibility_endpoint(
+    payload: UpgradeFeasibilityRequest,
+) -> JSONResponse:
+    """Check whether pinning a target package to candidate versions is feasible.
+
+    Accepts the exact same request body as ``/resolve`` plus a ``target``
+    package and 1-8 ``candidates`` versions.  Every candidate version must
+    exist in the supplied index under that package and stay unique after
+    PEP 440 normalization; unknown packages/versions, non-PEP 440 candidate
+    strings and normalized duplicates return 400.
+
+    Each candidate is evaluated by a full independent backtracking solve
+    with a temporary extra exact root requirement (``==<candidate>``) on the
+    target: the original root requirements still intersect it, every lock
+    (including one on the target) still participates, and the rest of the
+    dependency closure is re-solved from scratch — feasibility is never
+    inferred from the target's own version range.  Candidates keep their
+    input order and each carries its own ``ok`` / ``conflict`` /
+    ``undetermined`` status, ``attempts`` and, on success, the complete
+    resolution plus the version changes against the unpinned baseline
+    solve.  Hitting ``max_attempts`` is ``undetermined`` and is never
+    treated as uninstallable.  Valid requests always return 200.
+    """
+    index, entries, locks = _parse_input(payload)
+    body = run_upgrade_feasibility(
+        index,
+        entries,
+        locks,
+        allow_prereleases=payload.allow_prereleases,
+        marker_env=payload.marker_env,
+        max_attempts=payload.max_attempts,
+        target_package=payload.target,
+        candidates=payload.candidates,
     )
     return JSONResponse(status_code=200, content=body)
 
